@@ -19,6 +19,7 @@ import sys
 import json
 import asyncio
 import argparse
+import re
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from copy import deepcopy
@@ -30,9 +31,20 @@ import numpy as np
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from dotenv import load_dotenv
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopManager, AgentLoopOutput, register
-from verl.utils.profiler import simple_timer
-from verl.workers.rollout.replica import TokenOutput
+
+VERL_AVAILABLE = True
+try:
+    from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopManager, AgentLoopOutput, register
+    from verl.utils.profiler import simple_timer
+    from verl.workers.rollout.replica import TokenOutput
+except ImportError:
+    VERL_AVAILABLE = False
+    AgentLoopBase = object
+    AgentLoopManager = object
+    AgentLoopOutput = object
+    register = lambda x: (lambda cls: cls)
+    simple_timer = None
+    TokenOutput = None
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -63,30 +75,339 @@ class BrowsecompRewardManager:
             return 0.0
 
 
-class OSPDAdvantageComputer:
-    """OSPD (On-Policy Self-Distillation) advantage computation.
+class TeacherEvaluator:
+    """Teacher evaluates each step's influence on problem solving.
 
-    Key insight:
-    - Teacher = Student = current model (same weights)
-    - Teacher Forward: model(s_t + hint, a_t) - forward with hint context
-    - Student Forward: model(s_t, a_t) - forward without hint
-    - Advantage = logprob_teacher - logprob_student (token-level)
+    Teacher receives:
+    - Question Q
+    - Complete trajectory up to previous step τ_{<i}
+    - Current step output a_i
+    - Current step tool call result r_i
+
+    Teacher outputs:
+    - Influence coefficient α_i ∈ ℝ (positive=helpful, negative=harmful, zero=no effect)
+
+    Note: Currently for recording/analysis only, does NOT participate in reward allocation.
     """
 
-    def __init__(self, weight_osdp: float = 0.1):
-        self.weight_osdp = weight_osdp
+    def __init__(self, model_name: str = "deepseek-chat"):
+        self.model_name = model_name
+        self.evaluation_cache = {}
 
-    def compute_hint_advantage(self, step_data: Dict[str, Any]) -> float:
-        """Compute OSPD advantage for a single step.
+    async def evaluate_step_influence(
+        self,
+        question: str,
+        trajectory_history: List[Dict],
+        step_output: str,
+        tool_result: str,
+    ) -> float:
+        """Evaluate step influence coefficient α_i.
 
-        If hint is provided (failed step with feedback):
-            A_osdp = 0.5 (positive signal to learn from hint)
-        Else:
-            A_osdp = 0.0 (no distillation signal)
+        Args:
+            question: The question being answered
+            trajectory_history: List of previous steps, each with keys: s_t, a_t, env_obs
+            step_output: Current step's output (a_i)
+            tool_result: Current step's tool call result (r_i)
+
+        Returns:
+            α_i ∈ ℝ: influence coefficient
         """
-        if step_data.get("hint"):
-            return self.weight_osdp * 0.5
-        return 0.0
+        cache_key = f"{hash(question)}_{hash(str(trajectory_history))}_{hash(step_output)}_{hash(tool_result)}"
+        if cache_key in self.evaluation_cache:
+            return self.evaluation_cache[cache_key]
+
+        prompt = self._build_evaluation_prompt(
+            question, trajectory_history, step_output, tool_result
+        )
+
+        try:
+            response = await self._call_llm(prompt)
+            alpha = self._parse_alpha_response(response)
+            self.evaluation_cache[cache_key] = alpha
+            return alpha
+        except Exception as e:
+            print(f"[TeacherEvaluator] Error evaluating step: {e}")
+            return 1.0
+
+    def _build_evaluation_prompt(
+        self,
+        question: str,
+        trajectory_history: List[Dict],
+        step_output: str,
+        tool_result: str,
+    ) -> str:
+        """Build prompt for teacher evaluation."""
+        history_str = ""
+        for i, step in enumerate(trajectory_history):
+            a_t = step.get("a_t", "")
+            env_obs = step.get("env_obs", "")
+            history_str += f"\n[Step {i+1}] Output: {a_t[:200]}"
+            if env_obs:
+                history_str += f"\n[Step {i+1}] Tool Result: {env_obs[:200]}"
+
+        prompt = f"""You are evaluating the influence of a step on problem solving.
+
+Question: {question}
+{history_str}
+
+Current Step Output: {step_output}
+Current Step Tool Result: {tool_result}
+
+Rate the influence of the CURRENT STEP on solving the question.
+Consider:
+- Is this step helpful for solving the problem?
+- Is it harmful or leading in the wrong direction?
+- Is it neutral (just filler)?
+
+Output format: Just output a single float number:
+- > 1.0: More helpful than average
+- 1.0: Normal/average helpfulness
+- 0.0 to 1.0: Less helpful than average
+- 0.0: Neutral/no contribution
+- < 0.0: Harmful to solving the problem
+
+Your rating (float only):"""
+        return prompt
+
+    async def _call_llm(self, prompt: str) -> str:
+        """Call LLM for evaluation."""
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        response = client.chat.completions.create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=50,
+        )
+        return response.choices[0].message.content
+
+    def _parse_alpha_response(self, response: str) -> float:
+        """Parse alpha value from LLM response."""
+        import re
+        numbers = re.findall(r"-?\d+\.?\d*", response)
+        if numbers:
+            return float(numbers[0])
+        return 1.0
+
+
+class KLLLMEngine:
+    """LLM engine for computing token-level KL divergences.
+
+    Uses a local model (Qwen3-8B via HuggingFace) to compute:
+    1. Teacher forward: π_T(·|c_j) with s_t + hint context
+    2. Student forward: π_S(·|c_j) with s_t context only
+    3. Per-token KL divergence: D_KL(π_T || π_S)
+
+    This runs independently from the main rollout which uses AsyncLLM.
+    """
+
+    def __init__(self, model_path: str = "/data/huggingface_models/Qwen3-8B"):
+        self.model_path = model_path
+        self.model = None
+        self.tokenizer = None
+        self._initialized = False
+
+    def _init_model(self):
+        """Lazy initialization of the model."""
+        if self._initialized:
+            return
+
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            import torch
+            from pathlib import Path
+
+            model_path = str(self.model_path)
+
+            print(f"[KLLLMEngine] Loading model from {model_path}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                use_fast=False
+            )
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+            )
+            self.model.eval()
+            self._initialized = True
+            print("[KLLLMEngine] Model loaded successfully.")
+        except Exception as e:
+            print(f"[KLLLMEngine] Failed to load model: {e}")
+            print("[KLLLMEngine] KL computation will use uniform weights.")
+            self._initialized = False
+
+    def compute_kl_divergence(
+        self,
+        teacher_input: str,
+        student_input: str,
+        target_tokens: List[str],
+    ) -> List[float]:
+        """Compute per-token KL divergence between teacher and student.
+
+        Args:
+            teacher_input: Input with hint (s_t + hint)
+            student_input: Input without hint (s_t)
+            target_tokens: List of tokens to compute KL for
+
+        Returns:
+            List of KL divergence values per token
+        """
+        if not self._initialized:
+            self._init_model()
+
+        if not self._initialized or self.model is None:
+            return [1.0] * len(target_tokens)
+
+        import torch
+        import torch.nn.functional as F
+
+        try:
+            teacher_inputs = self.tokenizer(
+                teacher_input,
+                return_tensors="pt",
+                truncation=True,
+                max_length=2048
+            ).to(self.model.device)
+
+            student_inputs = self.tokenizer(
+                student_input,
+                return_tensors="pt",
+                truncation=True,
+                max_length=2048
+            ).to(self.model.device)
+
+            input_len = teacher_inputs["input_ids"].shape[1]
+
+            with torch.no_grad():
+                teacher_logits = self.model(
+                    **teacher_inputs
+                ).logits[:, :-1, :]
+
+                student_logits = self.model(
+                    **student_inputs
+                ).logits[:, :-1, :]
+
+            teacher_probs = F.softmax(teacher_logits, dim=-1)
+            student_probs = F.softmax(student_logits, dim=-1)
+
+            min_len = min(teacher_probs.shape[1], student_probs.shape[1])
+            teacher_probs = teacher_probs[:, :min_len, :]
+            student_probs = student_probs[:, :min_len, :]
+
+            kl_divs = F.kl_div(
+                student_probs.log(),
+                teacher_probs,
+                reduction="none"
+            ).sum(dim=-1).squeeze(0)
+
+            kl_divs = kl_divs.cpu().float().numpy()
+            kl_divs = np.pad(kl_divs, (0, len(target_tokens) - len(kl_divs)), mode="constant")
+            kl_divs = np.abs(kl_divs)
+
+            return kl_divs.tolist()
+
+        except Exception as e:
+            print(f"[KLLLMEngine] KL computation error: {e}")
+            return [1.0] * len(target_tokens)
+
+
+class OSPDAdvantageComputer:
+    """OSPD (On-Policy Self-Distillation) Token-Level advantage computation.
+
+    Two-stage conservative allocation (aligned with PROJECT_IDEA.md):
+
+    Stage 1: Step-Level uniform distribution
+        A_step_i = R(τ) / N
+
+    Stage 2: Token-Level magnitude reweighting via KL divergence (aligned with RLSD)
+        Δ_j = D_KL(π_T(·|c_j) || π_S(·|c_j))
+        w_j = Δ_j / ΣΔ_k (normalized)
+        A_token_j = A_step_i × w_j
+
+    Key insight from RLSD:
+    - Direction (sign): determined by ORM/GRPO reward
+    - Magnitude: determined by token-level KL divergence
+    """
+
+    def __init__(self, weight_osdp: float = 1.0, model_path: str = "/data/huggingface_models/Qwen3-8B"):
+        self.weight_osdp = weight_osdp
+        self.kl_engine = KLLLMEngine(model_path=model_path)
+
+    def compute_token_level_kl(self, step_data: Dict[str, Any]) -> List[float]:
+        """Compute KL divergence for each token in a step using the KL engine.
+
+        Teacher: s_t + hint (if available)
+        Student: s_t only
+
+        Args:
+            step_data: Contains s_t, a_t, hint and other metadata
+
+        Returns:
+            List of KL divergence values per token (unnormalized)
+        """
+        s_t = step_data.get("s_t", "")
+        a_t = step_data.get("a_t", "")
+        hint = step_data.get("hint")
+
+        tokens = a_t.split()
+        if not tokens:
+            return [1.0]
+
+        teacher_input = s_t + f"\n\n[Hint]: {hint}" if hint else s_t
+        student_input = s_t
+
+        try:
+            kl_values = self.kl_engine.compute_kl_divergence(
+                teacher_input=teacher_input,
+                student_input=student_input,
+                target_tokens=tokens,
+            )
+            return kl_values
+        except Exception as e:
+            print(f"[OSPD] KL computation failed, using uniform: {e}")
+            return [1.0] * len(tokens)
+
+    def normalize_kl_to_weights(self, kl_values: List[float]) -> List[float]:
+        """Normalize KL values to weights that sum to 1."""
+        total = sum(kl_values)
+        if total <= 0:
+            return [1.0 / len(kl_values)] * len(kl_values)
+        return [v / total for v in kl_values]
+
+    def compute_token_advantages(
+        self,
+        step_data: Dict[str, Any],
+        A_step: float,
+    ) -> List[Dict[str, Any]]:
+        """Compute token-level advantages for a single step.
+
+        Args:
+            step_data: Contains a_t (step output) and other metadata
+            A_step: Step-level advantage from GRPO (R(τ)/N, uniform)
+
+        Returns:
+            List of token advantages with token text and advantage value
+        """
+        kl_values = self.compute_token_level_kl(step_data)
+        weights = self.normalize_kl_to_weights(kl_values)
+
+        tokens = step_data.get("a_t", "").split()
+        if len(tokens) != len(weights):
+            tokens = [f"token_{i}" for i in range(len(weights))]
+
+        token_advantages = []
+        for token, weight in zip(tokens, weights):
+            token_advantages.append({
+                "token": token,
+                "kl_value": kl_values[tokens.index(token)] if token in tokens else 0.0,
+                "weight": weight,
+                "A_token": A_step * weight * self.weight_osdp,
+            })
+
+        return token_advantages
 
 
 class GRPOAdvantageEstimator:
@@ -249,12 +570,21 @@ class TrajectoryExtractor:
 class MultiStageOSPDTrainer:
     """Multi-stage OSPD training pipeline using verl RayPPOTrainer.
 
+    Per PROJECT_IDEA.md:
+
+    Two-stage conservative allocation:
+    1. Step-Level uniform distribution: A_step_i = R(τ) / N
+    2. Token-Level KL divergence reweighting: A_token_j = A_step_i × w_j
+
+    Teacher evaluation (α_i) is recorded but does NOT participate in allocation.
+
     Stages:
     1. Rollout: Generate trajectories via async agent loop
     2. Reward: Compute rewards via benchmark LLM judge
     3. GRPO: Compute group-relative advantages
-    4. OSPD: Compute self-distillation advantages (teacher-student gap)
-    5. Train: Update policy with combined advantages
+    4. Teacher Eval: Evaluate step influences α_i (recorded only)
+    5. OSPD: Compute token-level advantages via KL divergence
+    6. Train: Update policy with combined advantages
     """
 
     def __init__(
@@ -276,7 +606,8 @@ class MultiStageOSPDTrainer:
 
         self.reward_manager = BrowsecompRewardManager()
         self.grpo_estimator = GRPOAdvantageEstimator()
-        self.ospd_computer = OSPDAdvantageComputer()
+        self.ospd_computer = OSPDAdvantageComputer(model_path=model_path)
+        self.teacher_evaluator = TeacherEvaluator()
 
         self.rollouts_dir = self.output_dir / "rollouts"
         self.rollouts_dir.mkdir(exist_ok=True)
@@ -395,10 +726,24 @@ class MultiStageOSPDTrainer:
         return rewardeds
 
     def build_ospd_samples(self, trajectories: List[Dict]) -> List[Dict]:
-        """Build OSPD training samples with hints for failed steps."""
+        """Build OSPD training samples with teacher evaluation and token-level structure.
+
+        Per PROJECT_IDEA.md:
+        - Step-Level: uniform distribution A_step_i = R(τ) / N
+        - Token-Level: KL divergence based magnitude reweighting (w_j = Δ_j / ΣΔ_k)
+
+        Teacher evaluation (α_i) is recorded but does NOT affect actual allocation.
+        """
         samples = []
         for traj in trajectories:
-            for step in traj.get("steps", []):
+            num_steps = len(traj.get("steps", []))
+            if num_steps == 0:
+                continue
+
+            R_tau = traj.get("reward", 0.0)
+            A_step_uniform = R_tau / num_steps
+
+            for idx, step in enumerate(traj.get("steps", [])):
                 hint = None
                 if step["outcome"] in ["failed", "empty"]:
                     hint = self._generate_hint_from_feedback(
@@ -406,15 +751,24 @@ class MultiStageOSPDTrainer:
                     )
                     step["hint"] = hint
 
+                token_advantages = self.ospd_computer.compute_token_advantages(
+                    step, A_step_uniform
+                )
+
                 sample = {
                     "question": traj["question"],
+                    "traj_id": traj["id"],
+                    "step_idx": idx,
+                    "num_steps": num_steps,
+                    "R_tau": R_tau,
+                    "A_step_uniform": A_step_uniform,
                     "s_t": step["s_t"],
                     "a_t": step["a_t"],
-                    "A_macro": step.get("A_macro", 0.0),
                     "outcome": step["outcome"],
-                    "traj_id": traj["id"],
                     "hint": hint,
                     "s_enhanced": step["s_t"] + f"\n\n[Hint]: {hint}" if hint else step["s_t"],
+                    "token_advantages": token_advantages,
+                    "A_macro": step.get("A_macro", 0.0),
                 }
                 samples.append(sample)
 
@@ -436,14 +790,97 @@ class MultiStageOSPDTrainer:
         return "The current approach did not work. Consider trying a different strategy."
 
     def compute_combined_advantages(self, samples: List[Dict]) -> List[Dict]:
-        """Compute final advantages: A_final = A_GRPO + A_OSPD."""
+        """Compute final advantages with token-level KL-based reweighting.
+
+        Per PROJECT_IDEA.md:
+        - A_final = A_GRPO × w_j (where w_j is normalized KL divergence)
+        - Teacher evaluation α_i is recorded but not used in allocation
+        """
         for sample in samples:
             A_macro = sample["A_macro"]
-            A_osdp = self.ospd_computer.compute_hint_advantage(sample)
-            sample["A_osdp"] = A_osdp
-            sample["A_final"] = A_macro + A_osdp
+            token_advantages = sample.get("token_advantages", [])
+
+            if token_advantages:
+                total_A_tokens = sum(t["A_token"] for t in token_advantages)
+                sample["A_osdp"] = total_A_tokens
+                sample["A_final"] = A_macro + total_A_tokens
+
+                for i, t in enumerate(token_advantages):
+                    sample[f"token_{i}_A"] = t["A_token"]
+                    sample[f"token_{i}_kl"] = t["kl_value"]
+                    sample[f"token_{i}_weight"] = t["weight"]
+            else:
+                sample["A_osdp"] = 0.0
+                sample["A_final"] = A_macro
 
         return samples
+
+    async def evaluate_steps_with_teacher(
+        self,
+        trajectories: List[Dict],
+        max_concurrency: int = 16,
+    ) -> List[Dict]:
+        """Evaluate each step's influence using Teacher model.
+
+        Teacher receives:
+        - Question Q
+        - Complete trajectory up to previous step
+        - Current step output
+        - Current step tool result
+
+        Teacher outputs α_i (influence coefficient), recorded but NOT used in allocation.
+
+        Args:
+            trajectories: List of trajectories with extracted steps
+            max_concurrency: Maximum concurrent LLM calls
+
+        Returns:
+            Trajectories with step_alphas added to each step
+        """
+        print("\n[Teacher Evaluation] Evaluating step influences...")
+        sem = asyncio.Semaphore(max_concurrency)
+
+        async def eval_step(traj: Dict, step: Dict, step_idx: int) -> tuple:
+            async with sem:
+                history_before = traj.get("steps", [])[:step_idx]
+                try:
+                    alpha = await self.teacher_evaluator.evaluate_step_influence(
+                        question=traj.get("question", ""),
+                        trajectory_history=history_before,
+                        step_output=step.get("a_t", ""),
+                        tool_result=step.get("env_obs", ""),
+                    )
+                    return (traj.get("id"), step_idx, alpha)
+                except Exception as e:
+                    print(f"[TeacherEval] Error for {traj.get('id')}_step{step_idx}: {e}")
+                    return (traj.get("id"), step_idx, 1.0)
+
+        tasks = []
+        for traj in trajectories:
+            for idx, step in enumerate(traj.get("steps", [])):
+                tasks.append(eval_step(traj, step, idx))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        alpha_map = {}
+        for r in results:
+            if isinstance(r, tuple):
+                traj_id, step_idx, alpha = r
+                key = f"{traj_id}_{step_idx}"
+                alpha_map[key] = alpha
+
+        for traj in trajectories:
+            traj["step_alphas"] = []
+            for idx, step in enumerate(traj.get("steps", [])):
+                key = f"{traj.get('id')}_{idx}"
+                alpha = alpha_map.get(key, 1.0)
+                step["alpha_i"] = alpha
+                traj["step_alphas"].append(alpha)
+
+        avg_alpha = np.mean([a for a in alpha_map.values()]) if alpha_map else 1.0
+        print(f"  [TeacherEval] Evaluated {len(alpha_map)} steps, avg α = {avg_alpha:.3f}")
+
+        return trajectories
 
     async def run_epoch(
         self,
@@ -451,27 +888,41 @@ class MultiStageOSPDTrainer:
         epoch: int,
         max_concurrency: int = 32,
     ) -> Dict[str, Any]:
-        """Run one complete epoch of multi-stage OSPD training."""
+        """Run one complete epoch of multi-stage OSPD training.
+
+        Stages:
+        1. Rollout: Generate trajectories via async agent loop
+        2. Reward: Compute rewards via benchmark LLM judge
+        3. GRPO: Compute group-relative advantages
+        4. Teacher Eval: Evaluate step influences α_i (recorded, not used in allocation)
+        5. OSPD: Compute token-level advantages via KL divergence
+        6. Train: Update policy with combined advantages
+        """
         print(f"\n{'='*60}")
         print(f"[Epoch {epoch}] Multi-Stage OSPD Training")
         print(f"{'='*60}")
 
-        print("\n[Stage 1/5] Generating rollouts in parallel...")
+        print("\n[Stage 1/6] Generating rollouts in parallel...")
         trajectories = await self.generate_rollouts_parallel(dataset, max_concurrency)
         print(f"  Generated {len(trajectories)} trajectories")
 
-        print("\n[Stage 2/5] Computing rewards via benchmark LLM judge...")
+        print("\n[Stage 2/6] Computing rewards via benchmark LLM judge...")
         trajectories = await self.compute_rewards(trajectories)
         avg_reward = np.mean([t["reward"] for t in trajectories])
         print(f"  Average reward: {avg_reward:.4f}")
 
-        print("\n[Stage 3/5] Computing GRPO advantages...")
+        print("\n[Stage 3/6] Computing GRPO advantages...")
         trajectories = self.grpo_estimator.compute_group_advantages(trajectories)
         trajectories = self.grpo_estimator.broadcast_to_tokens(trajectories)
 
-        print("\n[Stage 4/5] Extracting steps and building OSPD samples...")
+        print("\n[Stage 4/6] Extracting steps from trajectories...")
         for traj in trajectories:
             traj["steps"] = TrajectoryExtractor.extract_with_thoughts(traj)
+
+        print("\n[Stage 5/6] Evaluating step influences with Teacher (α_i)...")
+        trajectories = await self.evaluate_steps_with_teacher(trajectories, max_concurrency)
+
+        print("\n[Stage 6/6] Building OSPD samples with token-level advantages...")
         samples = self.build_ospd_samples(trajectories)
         samples = self.compute_combined_advantages(samples)
         print(f"  Built {len(samples)} OSPD samples")
@@ -753,7 +1204,7 @@ async def main():
     parser.add_argument("--dataset", type=str, default="workspace/Browsecomp_zh/data/ASearcher_en_seed_data.jsonl")
     parser.add_argument("--rollouts", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--output", type=str, default="/data/yanfeizhang/AgenticOPSD/workspace/Browsecomp_zh/outputs")
+    parser.add_argument("--output", type=str, default="/data/yanfeizhang/OPSD_experiment/workspace/Browsecomp_zh/outputs")
     parser.add_argument("--max_concurrency", type=int, default=32)
     parser.add_argument("--rollout_limit", type=int, default=None)
     parser.add_argument("--search_mode", type=str, choices=["real", "local_simulated"], default="real")
@@ -926,7 +1377,7 @@ class OSPDAgentLoopFactory:
 
 def create_verl_agent_config(
     model_path: str,
-    output_dir: str = "/data/yanfeizhang/AgenticOPSD/workspace/Browsecomp_zh/outputs",
+    output_dir: str = "/data/yanfeizhang/OPSD_experiment/workspace/Browsecomp_zh/outputs",
     num_gpus: int = 1,
     rollout_n: int = 8,
 ) -> OmegaConf:

@@ -9,16 +9,16 @@
 set -e
 
 # Set working directory to project root
-cd /data/yanfeizhang/AgenticOPSD
+cd /data/yanfeizhang/OPSD_experiment
 
 source /data/anaconda3/etc/profile.d/conda.sh
-conda activate AgenticOPSD
+conda activate OPSD_experiment
 
 # Limit visible GPUs to cards 0-6 (7 GPUs total)
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6
 
 # Set Ray temporary directory to avoid read-only errors from other users' paths (e.g., wuhanwei)
-export RAY_TMPDIR="/data/yanfeizhang/AgenticOPSD/ray_tmp"
+export RAY_TMPDIR="/data/yanfeizhang/OPSD_experiment/ray_tmp"
 mkdir -p "$RAY_TMPDIR"
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 
@@ -49,9 +49,9 @@ PY
 fi
 
 # Set Hugging Face cache directory to a local writable path
-export HF_HOME="/data/yanfeizhang/AgenticOPSD/.cache/huggingface"
-export HF_DATASETS_CACHE="/data/yanfeizhang/AgenticOPSD/.cache/huggingface/datasets"
-export TMPDIR="/data/yanfeizhang/AgenticOPSD/.tmp"
+export HF_HOME="/data/yanfeizhang/OPSD_experiment/.cache/huggingface"
+export HF_DATASETS_CACHE="/data/yanfeizhang/OPSD_experiment/.cache/huggingface/datasets"
+export TMPDIR="/data/yanfeizhang/OPSD_experiment/.tmp"
 mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$TMPDIR"
 
 # Set Python path to ensure imports work correctly
@@ -85,6 +85,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_epochs=1 \
     data.train_files=['workspace/Browsecomp_zh/data/ASearcher_en_seed_data.jsonl'] \
     data.val_files=['workspace/Browsecomp_zh/data/val_data.jsonl'] \
-    hydra.run.dir=/data/yanfeizhang/AgenticOPSD/workspace/Browsecomp_zh/outputs/hydra_logs/\${now:%Y-%m-%d}/\${now:%H-%M-%S}
+    hydra.run.dir=/data/yanfeizhang/OPSD_experiment/workspace/Browsecomp_zh/outputs/hydra_logs/\${now:%Y-%m-%d}/\${now:%H-%M-%S}
 
 echo "Training completed!"

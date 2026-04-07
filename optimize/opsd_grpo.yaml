@@ -25,9 +25,9 @@ ray_kwargs:
   ray_init:
     runtime_env:
       env_vars:
-        HF_HOME: /data/yanfeizhang/AgenticOPSD/.cache/huggingface
-        HF_DATASETS_CACHE: /data/yanfeizhang/AgenticOPSD/.cache/huggingface/datasets
-        TMPDIR: /data/yanfeizhang/AgenticOPSD/.tmp
+        HF_HOME: /data/yanfeizhang/OPSD_experiment/.cache/huggingface
+        HF_DATASETS_CACHE: /data/yanfeizhang/OPSD_experiment/.cache/huggingface/datasets
+        TMPDIR: /data/yanfeizhang/OPSD_experiment/.tmp
 
 transfer_queue:
   enable: False
@@ -279,4 +279,4 @@ trainer:
   val_before_train: False
   test_freq: 10
   critic_warmup: 0
-  default_local_dir: /data/yanfeizhang/AgenticOPSD/workspace/Browsecomp_zh/outputs/checkpoints
+  default_local_dir: /data/yanfeizhang/OPSD_experiment/workspace/Browsecomp_zh/outputs/checkpoints
