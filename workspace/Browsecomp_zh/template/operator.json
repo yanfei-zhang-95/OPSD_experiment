@@ -1,0 +1,26 @@
+{
+    "Custom": {
+        "description": "Generates anything based on customized input and instruction.",
+        "interface": "custom(input: str, instruction: str) -> dict with key 'response' of type str"
+    },
+    "ScEnsemble": {
+        "description": "Uses self-consistency to select the solution that appears most frequently in the solution list, improve the selection to enhance the choice of the best solution.",
+        "interface": "sc_ensemble(solutions: List[str]) -> dict with key 'response' of type str"
+    },
+    "AnswerGenerate": {
+        "description": "Generate step by step based on the input. The step by step thought process is in the field of 'thought', and the final answer is in the field of 'answer'.",
+        "interface": "answer_generate(input: str) -> dict with key 'thought' of type str, 'answer' of type str"
+    },
+    "AgentGenerate": {
+        "description": "Generate the solution (with thought and tool calls) based on the input.",
+        "interface": "agent_generate(input: str) -> dict with key 'thought' of type str (The step by step thinking process), 'tool_call' of type str (The tool call in the following JSON format, required for ALL tool calls including get_final_answer: {\"name\": <function-name>, \"args\": <args-json-object>})"
+    },
+    "ReSum": {
+        "description": "Summarize the conversation history and current question to provide a comprehensive summary to compress the history to prevent the context window from being exceeded. Should be applied when total_input_tokens approaches the context_window limit (e.g., when total_input_tokens >= context_window * 0.8), NOT based on step count. The history would totally be reset and the cache (specifically the one passed via cache_manager, or the global one if not provided) is automatically cleared after the summarization. You are suggested to use it because if the context window is exceeded, it would cause the failure of the whole process.",
+        "interface": "resum(question: str, system_prompt: str, history: List[str], cache_manager: Optional[PageCacheManager] = None) -> tuple with key 'history' of type List[str], key 'total_input_tokens' of type int"
+    },
+    "AgentFold": {
+        "description": "Proactive context management operator for long-horizon web agents. Implements multi-level context folding mechanism with fine-grained condensation (preserves key details while removing redundancy) and deep integration (abstracts multi-step sub-tasks into high-level summaries). Supports both automatic decision-making (determines when and how to fold based on history length and complexity) and manual control (caller specifies fold level and timing). Compatible with ReSum interface. Paper: AgentFold: Long-Horizon Web Agents with Proactive Context Management (arXiv:2510.24699).",
+        "interface": "agentfold(question: str, system_prompt: str, history: List[str], fold_level: Optional[str] = None, auto_threshold: Optional[int] = None) -> List[dict]. Input parameters: question (str) - current question/task to be answered, system_prompt (str) - system prompt for the agent, history (List[str]) - conversation history (list of message dicts or strings), fold_level (Optional[str], default=None) - folding level: 'fine-grained' (preserve details, remove redundancy), 'deep' (abstract to high-level summaries), 'auto' (automatic decision), or None (full auto decision including whether to fold), auto_threshold (Optional[int], default=20) - threshold for automatic folding decision (number of history items). Output: List[dict] - processed history list compatible with ReSum interface. Returns new history with system prompt and folded context user message if folding is performed, or returns original history unchanged if no folding is needed."
+    }
+}

@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+.hydra/
+outputs/
+workspace/Browsecomp_zh/outputs/
+.DS_Store
